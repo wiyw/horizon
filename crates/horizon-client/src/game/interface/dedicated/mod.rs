@@ -184,6 +184,12 @@ pub(super) fn cached_user_by_id(id: u128) -> Option<NameAndId> {
     USER_CACHE.lock().unwrap().as_mut()?.get_by_id(id)
 }
 
+/// A player in the user cache by name (any case) while their entry hasn't expired, on a
+/// dedicated server: no profile lookup, no offline player.
+pub(super) fn cached_user_by_name(name: &str) -> Option<NameAndId> {
+    USER_CACHE.lock().unwrap().as_ref()?.find_by_name(name)
+}
+
 /// `server.toml`'s `[anticheat]`, beside server.properties when horizon-server runs the game; the
 /// default (on) without the file or the section, off (with an error logged) when the section is wrong.
 fn load_anticheat() -> horizon_anticheat::Config {
@@ -2560,12 +2566,15 @@ impl Game<'_> {
     }
 
     /// `Hub::kick`, with the server's `kick` event recorded. Whether it started the guest's
-    /// disconnect: false for a missing guest and one whose disconnect is already pending.
+    /// disconnect: false for a missing guest and one whose disconnect is already pending or who is hearing `player_leaving`.
     pub(super) fn kick_conn(&mut self, conn: u32, reason: Tag) -> bool {
         let Some(h) = self.lan.as_mut() else {
             return false;
         };
-        if h.hub.guest(conn).is_none_or(|g| g.disconnect_pending) {
+        if h.hub
+            .guest(conn)
+            .is_none_or(|g| g.disconnect_pending || g.leaving)
+        {
             return false;
         }
         h.hub.kick(conn, reason);

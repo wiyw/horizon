@@ -54,9 +54,12 @@ mod pending_move;
 mod raw_inbox;
 mod selector_sync;
 mod spawn_info;
+pub(super) mod terrain;
 use advancements::AdvancementOwners;
 use chat::yellow_names;
-pub use pending_move::{Accepted, Hearing, PendingMove};
+pub use pending_move::{
+    Accepted, Hearing, MOVE_PACKET_BUDGET, MOVE_PACKET_QUEUE, MovePacket, PendingMove,
+};
 use raw_inbox::{DeferredPayload, PacketDrain, yield_raw};
 pub mod game_event {
     pub const NO_RESPAWN_BLOCK_AVAILABLE: u8 = 0;
@@ -184,6 +187,15 @@ pub enum HostEvent {
     ),
     /// A changed movement report is held for the game to rule on ([`Hub::resolve_move`]).
     PlayerMove(u32),
+    /// A validated movement packet, whether or not it changes anything (`player_move_packet`).
+    PlayerMovePacket {
+        conn: u32,
+        to: [f64; 3],
+        to_rotation: [f32; 2],
+        on_ground: bool,
+        has_position: bool,
+        has_rotation: bool,
+    },
     /// An accepted position started a jump, before later gameplay packets.
     Jump {
         conn: u32,
@@ -208,6 +220,11 @@ pub enum HostEvent {
     Input {
         conn: u32,
         flags: i32,
+    },
+    /// A loaded guest's client answered a ping (`ServerboundPongPacket`) numbered `id`.
+    Pong {
+        conn: u32,
+        id: i32,
     },
     /// A guest was kicked, with the reason rendered by the hub.
     Kicked {
@@ -348,6 +365,9 @@ pub struct Hub {
     pending_kicks: Vec<HostEvent>,
     /// A native mod listens to `player_move`: a changed report waits for the game ([`pending_move`]).
     pub moves_listened: bool,
+    /// A native mod listens to `player_move_packet`: every validated movement packet is told to
+    /// the game.
+    pub move_packets_listened: bool,
     /// `[transfer]` on (a dedicated server's `--transfers`): the players a proxy
     /// said would arrive (`player-expect`). None while it is off.
     pub transfers: Option<super::arrivals::Transfers>,
@@ -365,16 +385,23 @@ pub struct Hub {
     /// Whether any native mod is loaded: `Input` and `Sneak` events only exist for them, so
     /// the hub queues none otherwise. The game sets it before each poll.
     pub mods_loaded: bool,
+    /// Whether a mod listens for `player_pong`: only then is a pong answering a ping queued. The
+    /// game sets it before each poll.
+    pub pong_listened: bool,
     /// Players a native mod hid (`native_hide_player`), by UUID, on or off:
     /// only players of at least that permission level see them, in the
     /// player list, the world and their joining and leaving.
     pub hidden: crate::fast_hash::FxHashMap<u128, u8>,
+    /// Players `refresh_player` hid from everyone: the level a mod hid them
+    /// at before (`hidden`), and the tick it began.
+    refreshing: Vec<(u128, u64)>,
     pub lan: Lan,
     pub config: HubConfig,
     /// What the hooks fired inside a click or a name format are given; the
     /// game replaces it on each reload.
     pub loop_context: Arc<LoopContext>,
     pub encoder: ChunkEncoder,
+    pub(in crate::lan) terrain: Option<Box<super::terrain_view::Views>>,
     pub guests: super::guest_list::GuestList,
     pub(super) sync: Arc<SyncData>,
     /// The active world session rule definitions.
@@ -845,10 +872,12 @@ impl Hub {
             selector_tokens: Vec::new(),
             native_menu_events: Vec::new(),
             chunk_watches: ChunkWatchLog::default(),
+            terrain: None,
             packet_drain: None,
             deferred_payloads: Default::default(),
             pending_kicks: Vec::new(),
             moves_listened: false,
+            move_packets_listened: false,
             transfers: None,
             native_tracking: Vec::new(),
             attachment_snapshots: Vec::new(),
@@ -856,7 +885,9 @@ impl Hub {
             native_advancement_grants: Vec::new(),
             native_reload_pending: false,
             mods_loaded: false,
+            pong_listened: false,
             hidden: Default::default(),
+            refreshing: Vec::new(),
             teams: Vec::new(),
             nicknames: std::collections::HashMap::new(),
             list_names: std::collections::HashMap::new(),
@@ -1342,9 +1373,38 @@ impl Hub {
     /// Whether a player of `permission` sees the player `uuid`: not one a
     /// native mod hid from players below a higher level.
     pub fn sees(&self, permission: u8, uuid: u128) -> bool {
-        self.hidden
-            .get(&uuid)
-            .is_none_or(|&level| permission >= level)
+        // A player being sent again (`refresh_player`) is out of everyone's lists for that time; the level a
+        // mod hid them at is a separate thing and stays what the mod set.
+        !self.refreshing.iter().any(|r| r.0 == uuid)
+            && self
+                .hidden
+                .get(&uuid)
+                .is_none_or(|&level| permission >= level)
+    }
+
+    /// Paper's `Player.hideEntity` and `showEntity`: the entity `entity` is never paired with
+    /// the client of the placed player `viewer` while hidden (`Tracker::hidden`), and is paired
+    /// again once shown. `None` when no such player is placed; otherwise whether it changed. A
+    /// change has the tracker check that client's pairs again on the next pass. Kept until the
+    /// player leaves.
+    pub fn set_entity_hidden_from(
+        &mut self,
+        viewer: u128,
+        entity: u128,
+        hidden: bool,
+    ) -> Option<bool> {
+        let index = (0..self.guests.len())
+            .find(|&i| self.guests[i].uuid == viewer && self.guests[i].placed)?;
+        Some(self.guests.update(index, |g| {
+            let changed = g.tracker.set_entity_hidden(entity, hidden);
+            g.moved |= changed;
+            changed
+        }))
+    }
+    /// Whether `Player.hideEntity` hid the entity `entity` from the placed player `viewer`.
+    pub fn entity_hidden_from(&self, viewer: u128, entity: u128) -> Option<bool> {
+        let guest = self.guests.iter().find(|g| g.uuid == viewer && g.placed)?;
+        Some(guest.tracker.entity_hidden(entity))
     }
 
     /// The player lists after `hidden` or a permission changed: each placed
@@ -1353,7 +1413,10 @@ impl Hub {
     /// checks the client's entity pairs again, so the tracker follows too.
     /// Nothing runs while nobody is hidden.
     fn sync_hidden(&mut self) {
-        if self.hidden.is_empty() && self.guests.iter().all(|g| g.tab_hidden.is_empty()) {
+        if self.hidden.is_empty()
+            && self.refreshing.is_empty()
+            && self.guests.iter().all(|g| g.tab_hidden.is_empty())
+        {
             return;
         }
         let candidates: Vec<usize> = (0..self.guests.len())
@@ -1362,11 +1425,15 @@ impl Hub {
                 self.guests[j].placed
                     && self.guests[j].participates_online()
                     && (self.hidden.contains_key(&u)
+                        || self.refreshing.iter().any(|r| r.0 == u)
                         || self.guests.iter().any(|g| g.tab_hidden.contains(&u)))
             })
             .collect();
         for i in 0..self.guests.len() {
-            if !self.guests[i].placed || !self.guests[i].participates_online() {
+            // A held client (waiting for its hand-over) keeps a picture of the players, the refresh included.
+            if !(self.guests[i].placed || self.guests[i].held)
+                || !self.guests[i].participates_online()
+            {
                 continue;
             }
             for &j in &candidates {
@@ -1419,6 +1486,7 @@ impl Hub {
                 .map(|g| {
                     listed_properties(
                         &g.properties,
+                        &g.profile_overrides,
                         self.singleplayer_owner == Some(g.uuid),
                         self.lan.shared.config.owner_profile.as_deref(),
                     )
@@ -1449,6 +1517,18 @@ impl Hub {
     }
     /// ClientboundPlayerInfoUpdatePacket.createPlayerInitializing: every action.
     const INFO_ACTIONS: u8 = 0xFF;
+
+    /// The player list entries to the guest at `i`, in as many packets as the frame limit needs: several
+    /// players with profiles of 16 properties each can pass it together, and a frame too large closes
+    /// the connection (`info_batches`).
+    fn send_player_list(&self, i: usize, entries: Vec<play::PlayerInfo>) {
+        for entries in info_batches(Self::INFO_ACTIONS, entries) {
+            self.guests[i].send(&C::PlayerInfoUpdate(play::PlayerInfoUpdate {
+                actions: Self::INFO_ACTIONS,
+                entries,
+            }));
+        }
+    }
 
     // ---- joining -------------------------------------------------------
 
@@ -1599,10 +1679,7 @@ impl Hub {
             ));
         }
         self.guests.update(i, |g| g.tab_hidden.extend(hidden));
-        self.guests[i].send(&C::PlayerInfoUpdate(play::PlayerInfoUpdate {
-            actions: Self::INFO_ACTIONS,
-            entries,
-        }));
+        self.send_player_list(i, entries);
         let newcomer = C::PlayerInfoUpdate(play::PlayerInfoUpdate {
             actions: Self::INFO_ACTIONS,
             entries: vec![self.player_info(uuid, &name, mode, 0)],
@@ -1720,10 +1797,7 @@ impl Hub {
                 )
             })
             .collect();
-        self.guests[i].send(&C::PlayerInfoUpdate(play::PlayerInfoUpdate {
-            actions: Self::INFO_ACTIONS,
-            entries,
-        }));
+        self.send_player_list(i, entries);
         recentered
     }
 
@@ -2320,6 +2394,7 @@ impl Hub {
     /// packets queued for its own level's pass.
     pub fn poll(&mut self, ctx: &mut TickCtx) -> Vec<HostEvent> {
         self.ticks += 1;
+        self.end_refreshes();
         self.anticheat_tick(ctx.tick_rate);
         let mut events = self.begin_payload_poll();
         self.finish_fake_kicks(&mut events);
@@ -2556,6 +2631,9 @@ impl Hub {
 
     pub(super) fn remove_guest(&mut self, i: usize, reason: &str) -> Guest {
         let mut g = self.guests.remove(i);
+        if let Some(terrain) = self.terrain.as_mut() {
+            terrain.players.remove(&g.conn);
+        }
         super::chunk_watch::unwatch_all(&mut self.chunk_watches, &mut g);
         if let Some(m) = g
             .menu
@@ -2775,6 +2853,7 @@ impl Hub {
     /// the save's readers made them.
     fn update_chunks(&mut self, ctx: &TickCtx) {
         let world = &*ctx.world;
+        self.prepare_terrain_pass();
         if let Some(far) = self.far.as_mut() {
             far.poll();
         }
@@ -2782,7 +2861,12 @@ impl Hub {
         let mut batches = Vec::new();
         for i in 0..self.guests.len() {
             if self.watches(&self.guests[i]) {
+                let moved =
+                    self.terrain.is_some() && self.guests[i].center != Some(self.guests[i].chunk());
                 self.update_view(i, watching);
+                if moved || self.terrain.is_some() && self.ticks <= self.guests[i].placed_at + 1 {
+                    self.warm_first_terrain(i, world, ctx.streaming);
+                }
                 if let Some(batch) = self.next_batch(i, world, ctx.streaming) {
                     batches.push((i, batch));
                 }
@@ -2795,18 +2879,53 @@ impl Hub {
         // number of batches that take it.
         let mut columns = Columns::default();
         let mut far_bodies = crate::fast_hash::FxHashMap::default();
+        let mut protected = terrain::Bodies::default();
+        let protos = |x, z| ctx.streaming.and_then(|s| s.proto_sections(x, z));
         let batches: Vec<_> = batches
             .into_iter()
             .map(|(i, batch)| {
+                let rules = self.terrain_rules(self.guests[i].conn);
                 let (taken, mut bodies): (Vec<_>, Vec<_>) = batch
                     .near
                     .into_iter()
-                    .map(|(idx, chunk)| (idx, Body::Level(columns.add(chunk))))
+                    .filter_map(|(idx, chunk)| {
+                        let at = (chunk.x, chunk.z);
+                        match rules.as_ref() {
+                            None => Some((idx, Body::Level(columns.add(chunk)))),
+                            Some(rules) => match self.protected_ready(rules, world, &protos, at)? {
+                                super::terrain_view::Ready::Ordinary => {
+                                    Some((idx, Body::Level(columns.add(chunk))))
+                                }
+                                ready => self
+                                    .finish_protected_body(
+                                        &mut protected,
+                                        (rules.generation, at, false),
+                                        chunk,
+                                        world,
+                                        &protos,
+                                        ready,
+                                    )
+                                    .map(|body| (idx, Body::Saved(body))),
+                            },
+                        }
+                    })
                     .unzip();
                 let mut far = Vec::new();
                 for (idx, column) in batch.far {
-                    far.push(idx);
                     let body = match column {
+                        Column::Level(chunk) if rules.is_some() => {
+                            let Some(body) = self.protected_body(
+                                &mut protected,
+                                rules.as_ref().unwrap(),
+                                chunk,
+                                world,
+                                &protos,
+                                true,
+                            ) else {
+                                continue;
+                            };
+                            body
+                        }
                         Column::Level(chunk) => far_bodies
                             .entry((chunk.x, chunk.z))
                             .or_insert_with(|| {
@@ -2815,6 +2934,7 @@ impl Hub {
                             .clone(),
                         Column::Saved(body) => body,
                     };
+                    far.push(idx);
                     bodies.push(Body::Saved(body));
                 }
                 (i, taken, far, bodies)
@@ -2827,6 +2947,13 @@ impl Hub {
         let uses = &mut columns.uses;
         let chunks = &columns.chunks;
         for (i, taken, far, batch) in batches {
+            let g = &self.guests[i];
+            let keys = taken
+                .iter()
+                .map(|&i| g.chunk_queue[i])
+                .chain(far.iter().map(|&i| g.far_queue[i]));
+            let overlays = self.terrain_overlays(g.conn, world, keys);
+            let protected = self.terrain_protected(g.conn, &g.dimension);
             self.guests.update(i, |g| {
                 let size = batch.len();
                 // The single-player window shares the sections it is sent (handoff.rs).
@@ -2836,22 +2963,25 @@ impl Hub {
                     g.send(&C::ChunkBatchStart(horizon_protocol::packets::Empty));
                     g.sender.send_many(batch.into_iter().map(|body| match body {
                         Body::Level(j) => {
-                            if memory {
+                            if memory && !protected {
                                 super::handoff::offer(chunks[j]);
                             }
                             uses[j] -= 1;
                             if uses[j] == 0 {
-                                std::mem::take(&mut encoded[j])
+                                super::Body::Owned(std::mem::take(&mut encoded[j]))
                             } else {
-                                encoded[j].clone()
+                                super::Body::Owned(encoded[j].clone())
                             }
                         }
-                        Body::Saved(body) => body.to_vec(),
+                        Body::Saved(body) => super::Body::Shared(body),
                     }));
                     g.send(&C::ChunkBatchFinished(play::ChunkBatchFinished {
                         size: size as i32,
                     }));
                     g.unacknowledged += 1;
+                }
+                if !overlays.is_empty() {
+                    g.sender.send_many(overlays);
                 }
                 if watching {
                     // ChunkMap.markChunkPendingToSend, then PlayerChunkSender.sendChunk's end:
@@ -2899,6 +3029,16 @@ impl Hub {
         let (cx, cz) = self.guests[i].chunk();
         let r = self.guests[i].view_distance;
         let reach = self.reach(&self.guests[i]);
+        if self.guests[i].center != Some((cx, cz))
+            && let Some(reveals) = self
+                .terrain
+                .as_mut()
+                .and_then(|v| v.players.get_mut(&self.guests[i].conn))
+                .and_then(|levels| levels.get_mut(&self.config.dimension))
+                .map(|selection| &mut selection.reveals)
+        {
+            reveals.retain(|&(x, _, z)| tracked(cx, cz, reach, x >> 4, z >> 4));
+        }
         self.guests.update(i, |g| {
             if g.center == Some((cx, cz)) {
                 return;
@@ -2997,12 +3137,37 @@ impl Hub {
                     )
                 })
         };
+        let rules = self.terrain_rules(g.conn);
+        let protos = |x, z| streaming.and_then(|s| s.proto_sections(x, z));
+        let encode = super::terrain_view::EncodeContext {
+            dimension: &self.config.dimension,
+            encoder: &self.encoder,
+            world,
+            protos: &protos,
+            include_far: self.far.is_some(),
+        };
+        let mut terrain = self.terrain.as_mut();
         let near: Vec<_> = g
             .chunk_queue
             .iter()
             .enumerate()
             .filter_map(|(idx, key)| Some((idx, &**world.chunks.get(key)?)))
             .filter(|(_, c)| ready(c))
+            .take(if rules.is_some() {
+                near_take.saturating_add(32)
+            } else {
+                usize::MAX
+            })
+            .filter(|(_, c)| {
+                rules.as_ref().is_none_or(|rules| {
+                    terrain
+                        .as_deref_mut()
+                        .unwrap()
+                        .resident
+                        .get(&encode, rules, (c.x, c.z))
+                        .is_some()
+                })
+            })
             .take(near_take)
             .collect();
         let mut far = Vec::new();
@@ -3027,7 +3192,12 @@ impl Hub {
                     // Far columns carry all their own saved light layers. They need no
                     // neighbour views, including at the edge of the level's loading buffer.
                     Some(c) if c.lit => Column::Level(c),
-                    _ => match ring.saved(x, z) {
+                    Some(_) if rules.is_some() => continue,
+                    _ => match if let Some(rules) = &rules {
+                        ring.saved_for_view(x, z, rules, world)
+                    } else {
+                        ring.saved(x, z)
+                    } {
                         super::far::Saved::Body(body) => Column::Saved(body),
                         super::far::Saved::Missing | super::far::Saved::Waiting => {
                             continue;
@@ -3363,7 +3533,7 @@ impl Hub {
                 );
                 state.spectator = g.spectator();
                 state.watching = g.watching;
-                state.hidden = self.hidden.get(&g.uuid).copied();
+                state.hidden = self.tracker_hidden(g.uuid);
                 stuck_meta(&mut state.meta, &mut state.defaults, g.stuck);
                 frozen_meta(&mut state, g.motion.as_ref().map_or(0, |m| m.ticks_frozen));
                 // Entity.getDeltaMovement: the server copy's, which a glide sends.
@@ -4106,7 +4276,16 @@ impl Hub {
                             }
                         });
                         let rot = (p.yaw, p.pitch);
-                        self.position_change(i, at, rot, 0, Hearing::Confirmation, ctx, events);
+                        self.position_change(
+                            i,
+                            at,
+                            rot,
+                            0,
+                            (true, true),
+                            Hearing::Confirmation,
+                            ctx,
+                            events,
+                        );
                     }
                 }
                 // handlePlayerAbilities: the client flies only if it may.
@@ -4162,7 +4341,22 @@ impl Hub {
                         g.max_unacknowledged = 10;
                     });
                 }
-                S::Pong(p) => self.anticheat_pong(i, p.id),
+                S::Pong(p) => {
+                    self.anticheat_pong(i, p.id);
+                    // The event only tells the mods, and only of an answer to a ping the server
+                    // sent (used up by it): nothing is queued for the rest, or with no listener.
+                    // Without a listener the ledger is still kept, so one listening later is not
+                    // fed stale pings.
+                    let answers_a_ping = self.guests.get(i).is_some_and(|g| {
+                        g.pings
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .answered(p.id, std::time::Instant::now())
+                    });
+                    if self.pong_listened && answers_a_ping {
+                        events.push(HostEvent::Pong { conn, id: p.id });
+                    }
+                }
                 // ServerGamePacketListenerImpl.handlePingRequest: echo on this connection.
                 S::PingRequest(p) => self.send_to(conn, &C::PongResponse(p)),
                 // handleAttack is the game's too: a move queued behind an attack would move
@@ -4405,6 +4599,7 @@ impl Hub {
         ctx: &TickCtx,
         events: &mut Vec<HostEvent>,
     ) {
+        let shape = (pos.is_some(), rot.is_some());
         let conn = self.guests[i].conn;
         // containsInvalidValues, on the packet's values (0 where it has none).
         let (yaw, pitch) = rot.unwrap_or_default();
@@ -4446,7 +4641,7 @@ impl Hub {
         }
         let to = pos.unwrap_or(g.position);
         let rot = rot.unwrap_or((g.yaw, g.pitch));
-        self.position_change(i, to, rot, flags, Hearing::Heard, ctx, events);
+        self.position_change(i, to, rot, flags, shape, Hearing::Heard, ctx, events);
     }
 
     /// ServerGamePacketListenerImpl.handlePlayerPositionChange.
@@ -4456,6 +4651,7 @@ impl Hub {
         to: [f64; 3],
         (yaw, pitch): (f32, f32),
         flags: u8,
+        (has_position, has_rotation): (bool, bool),
         hearing: Hearing,
         ctx: &TickCtx,
         events: &mut Vec<HostEvent>,
@@ -4537,6 +4733,7 @@ impl Hub {
         }
         // The anticheat's `ground`: a claim of the ground with nothing to
         // stand on is dropped (no-fall, walking on water).
+        let client_on_ground = flags & 1 != 0;
         let (mut flags, mut corrected) = (flags, false);
         if flags & 1 != 0 && self.anticheat.is_some() {
             match self.anticheat_ground(i, to, stands, ctx, events) {
@@ -4581,6 +4778,9 @@ impl Hub {
             flags,
             stands,
             floating,
+            on_ground: client_on_ground,
+            has_position,
+            has_rotation,
         };
         self.accept_move(i, accepted, hearing, events);
     }
@@ -4640,14 +4840,11 @@ impl Hub {
             }
         }
         for pos @ [x, y, z] in positions {
+            self.send_block_correction(conn, ctx.world, pos);
+            if !self.terrain_metadata_visible(conn, ctx.world, pos) {
+                continue;
+            }
             let state = ctx.world.block(x, y, z);
-            self.send_to(
-                conn,
-                &C::BlockUpdate(play::BlockUpdate {
-                    pos,
-                    state: state.0 as i32,
-                }),
-            );
             let Some(entity) = ctx.world.block_entities.get(&(x, y, z)) else {
                 continue;
             };
@@ -4729,6 +4926,50 @@ impl Hub {
     /// A player's nickname changed (None: their name again): kept for chat,
     /// and the Tab list shows it (PlayerInfo UPDATE_DISPLAY_NAME for
     /// everyone).
+    /// Paper's `hidePlayer` then `showPlayer` for every other player (as
+    /// SkinsRestorer refreshes a skin): the next tick takes the player out of
+    /// their Tab lists and worlds (`sync_hidden`, the entity tracker), the one
+    /// after brings them back with their profile as it is then. A level a mod
+    /// hid them at is kept.
+    pub fn refresh_player(&mut self, uuid: u128) {
+        if let Some(pending) = self.refreshing.iter_mut().find(|r| r.0 == uuid) {
+            pending.1 = self.ticks;
+            return;
+        }
+        self.refreshing.push((uuid, self.ticks));
+    }
+
+    /// The permission level the entity tracker hides a player from: everyone's while the player is
+    /// being sent again (`refresh_player`, so watching clients get the removal and the respawn around the
+    /// profile update), else the level a mod hid them at.
+    pub fn tracker_hidden(&self, uuid: u128) -> Option<u8> {
+        if self.refreshing.iter().any(|r| r.0 == uuid) {
+            return Some(u8::MAX);
+        }
+        self.hidden.get(&uuid).copied()
+    }
+    /// The profile properties the player list gives the guest at `i` now: those it logged in with, or for
+    /// the integrated server's owner the signed-in account's once fetched, with a mod's overrides by name.
+    pub fn listed_profile_properties(
+        &self,
+        i: usize,
+    ) -> Vec<horizon_protocol::packets::login::Property> {
+        let g = &self.guests[i];
+        listed_properties(
+            &g.properties,
+            &g.profile_overrides,
+            self.singleplayer_owner == Some(g.uuid),
+            self.lan.shared.config.owner_profile.as_deref(),
+        )
+    }
+
+    /// Shows the players `refresh_player` took out of the lists a whole tick ago again, at the level a mod
+    /// hides them at (or to everyone): the refresh never touched that level.
+    pub fn end_refreshes(&mut self) {
+        let ticks = self.ticks;
+        self.refreshing.retain(|r| r.1 + 1 >= ticks);
+    }
+
     pub fn set_nickname(&mut self, uuid: u128, nickname: Option<String>) {
         match nickname {
             Some(n) => self.nicknames.insert(uuid, n),
@@ -5231,18 +5472,92 @@ fn shared_flags(sneaking: bool, sprinting: bool, body: &BodyFlags) -> i8 {
     shared
 }
 
+/// What the entries of one `PlayerInfoUpdate` may add up to: the frame limit less room for the packet
+/// id, the actions byte and the entry count.
+const INFO_BATCH_LIMIT: usize = horizon_protocol::frame::MAX_FRAME - 1024;
+
+/// `entries` split, in order, into packets whose frames stay under the frame limit: a batch ends before
+/// the entry that would pass `INFO_BATCH_LIMIT` (an entry is measured as it is encoded, which is
+/// above the frame's compressed size). One entry alone is under the limit (a profile holds at most 16
+/// properties of at most 32767 characters), so a batch is never empty, except for no entries at all:
+/// that gives one empty batch, as the join always sent its list.
+fn info_batches(actions: u8, entries: Vec<play::PlayerInfo>) -> Vec<Vec<play::PlayerInfo>> {
+    use horizon_protocol::buf::{Codec, Writer};
+    let mut batches = vec![Vec::new()];
+    let mut size = 0;
+    for entry in entries {
+        let mut one = play::PlayerInfoUpdate {
+            actions,
+            entries: vec![entry],
+        };
+        let mut w = Writer::new();
+        play::PlayerInfoUpdate::write(&one, &mut w);
+        let entry_size = w.data.len();
+        let entry = one.entries.pop().expect("the entry just put in");
+        let batch = batches.last_mut().expect("a batch is always open");
+        if !batch.is_empty() && size + entry_size > INFO_BATCH_LIMIT {
+            batches.push(vec![entry]);
+            size = entry_size;
+        } else {
+            batch.push(entry);
+            size += entry_size;
+        }
+    }
+    batches
+}
+
+/// `ExtraCodecs.PROPERTY_MAP`'s limit: a client rejects a player list update with more properties.
+pub const MAX_LISTED_PROPERTIES: usize = 16;
+
 /// The profile properties the player list gives a player: those it logged
 /// in with, or for the integrated server's owner (who logs in with none) the
-/// signed-in account's, once fetched (`IntegratedServer.getSingleplayerProfile`).
+/// signed-in account's, once fetched (`IntegratedServer.getSingleplayerProfile`),
+/// with the properties a mod set (`overrides`) over them by name. An override neither takes the
+/// account's other properties away nor, set before the fetch finished, keeps the fetched skin
+/// from showing. At most 16 are listed (a client refuses more): the overrides win, and the
+/// properties that are not overridden fill the slots left, in their order.
 fn listed_properties(
     logged_in: &[horizon_protocol::packets::login::Property],
+    overrides: &[horizon_protocol::packets::login::Property],
     owner: bool,
     profile: Option<&super::OwnerProfile>,
 ) -> Vec<horizon_protocol::packets::login::Property> {
-    match profile {
-        Some(profile) if owner && logged_in.is_empty() => profile.properties().to_vec(),
-        _ => logged_in.to_vec(),
+    type Property = horizon_protocol::packets::login::Property;
+    let base: &[Property] = match profile {
+        Some(profile) if owner => profile.properties(),
+        _ => logged_in,
+    };
+    // The overrides, one a name (the later wins), at most 16.
+    let mut wins: Vec<&Property> = Vec::new();
+    for property in overrides {
+        match wins.iter_mut().find(|p| p.name == property.name) {
+            Some(old) => *old = property,
+            None => wins.push(property),
+        }
     }
+    wins.truncate(MAX_LISTED_PROPERTIES);
+    let mut room = MAX_LISTED_PROPERTIES - wins.len();
+    let mut listed: Vec<Property> = Vec::with_capacity(MAX_LISTED_PROPERTIES);
+    for property in base {
+        match wins.iter().find(|p| p.name == property.name) {
+            Some(win) => {
+                if !listed.iter().any(|p| p.name == win.name) {
+                    listed.push((*win).clone());
+                }
+            }
+            None if room > 0 => {
+                room -= 1;
+                listed.push(property.clone());
+            }
+            None => {}
+        }
+    }
+    for win in wins {
+        if !listed.iter().any(|p| p.name == win.name) {
+            listed.push(win.clone());
+        }
+    }
+    listed
 }
 
 /// The source in wire slot order: hands, armor feet..head, body, saddle.
@@ -5303,8 +5618,11 @@ mod tests {
     mod pending_move_bound_tests;
     mod pending_move_scope_tests;
     mod pending_move_tests;
+    mod pong_tests;
     mod skin_outer_layer_tests;
     mod sound_tests;
+    mod terrain_send_bench;
+    mod terrain_view_tests;
     use super::*;
     use crate::fast_hash::FxHashSet;
 
@@ -7709,6 +8027,28 @@ mod tests {
         }
     }
 
+    /// While a player is sent again the entity tracker hides them from everyone (watching clients get the
+    /// removal and the respawn around the profile update); afterwards it hides them at the level a mod set.
+    #[test]
+    fn a_refresh_hides_the_player_from_the_entity_tracker_and_gives_back_the_mods_level() {
+        let (mut hub, _rx) = hub_with_a_guest();
+        assert_eq!(hub.tracker_hidden(1), None);
+        hub.hidden.insert(1, 3);
+        assert_eq!(hub.tracker_hidden(1), Some(3));
+        hub.refresh_player(1);
+        assert_eq!(
+            hub.tracker_hidden(1),
+            Some(u8::MAX),
+            "out of every client's tracking"
+        );
+        assert!(!hub.sees(255, 1));
+        hub.ticks += 2;
+        hub.end_refreshes();
+        assert_eq!(hub.tracker_hidden(1), Some(3), "the mod's level again");
+        hub.hidden.remove(&1);
+        assert_eq!(hub.tracker_hidden(1), None);
+    }
+
     /// The owner is listed with the account's skin once the fetch answered,
     /// with none before (no wait) or when it failed; other players keep the
     /// properties they logged in with, and none of the owner's.
@@ -7717,11 +8057,21 @@ mod tests {
         let (answer, fetched) = std::sync::mpsc::channel();
         let profile = super::super::OwnerProfile::new(move || fetched.recv().unwrap_or_default());
         let start = std::time::Instant::now();
-        assert!(listed_properties(&[], true, Some(&profile)).is_empty());
+        assert!(listed_properties(&[], &[], true, Some(&profile)).is_empty());
         assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        // A property a mod set before the fetch answered is listed alone, and gives way to nothing later.
+        let badge = horizon_protocol::packets::login::Property {
+            name: "example:badge".into(),
+            value: "1".into(),
+            signature: None,
+        };
+        assert_eq!(
+            listed_properties(&[], std::slice::from_ref(&badge), true, Some(&profile)),
+            vec![badge.clone()]
+        );
         answer.send(vec![textures("owner")]).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while listed_properties(&[], true, Some(&profile)).is_empty() {
+        while listed_properties(&[], &[], true, Some(&profile)).is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the fetch never landed"
@@ -7729,17 +8079,26 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(
-            listed_properties(&[], true, Some(&profile)),
+            listed_properties(&[], &[], true, Some(&profile)),
             vec![textures("owner")]
+        );
+        // A mod's property is an override by name: the account's others stay, its own textures replace.
+        assert_eq!(
+            listed_properties(&[], std::slice::from_ref(&badge), true, Some(&profile)),
+            vec![textures("owner"), badge.clone()]
+        );
+        assert_eq!(
+            listed_properties(&[], &[textures("mod")], true, Some(&profile)),
+            vec![textures("mod")]
         );
         // A guest: its own properties (online mode), or none (offline mode).
         assert_eq!(
-            listed_properties(&[textures("guest")], false, Some(&profile)),
+            listed_properties(&[textures("guest")], &[], false, Some(&profile)),
             vec![textures("guest")]
         );
-        assert!(listed_properties(&[], false, Some(&profile)).is_empty());
+        assert!(listed_properties(&[], &[], false, Some(&profile)).is_empty());
         // No signed-in account (no fetch): as before.
-        assert!(listed_properties(&[], true, None).is_empty());
+        assert!(listed_properties(&[], &[], true, None).is_empty());
         let failed = super::super::OwnerProfile::new(Vec::new);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while failed.properties.get().is_none() {
@@ -7747,7 +8106,135 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
-        assert!(listed_properties(&[], true, Some(&failed)).is_empty());
+        assert!(listed_properties(&[], &[], true, Some(&failed)).is_empty());
+    }
+
+    fn property(name: &str, value: &str) -> horizon_protocol::packets::login::Property {
+        horizon_protocol::packets::login::Property {
+            name: name.into(),
+            value: value.into(),
+            signature: None,
+        }
+    }
+
+    /// An owner profile whose fetch has answered with `properties`.
+    fn fetched(
+        properties: Vec<horizon_protocol::packets::login::Property>,
+    ) -> super::super::OwnerProfile {
+        let profile = super::super::OwnerProfile::new(move || properties.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while profile.properties().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fetch never landed"
+            );
+            std::thread::yield_now();
+        }
+        profile
+    }
+
+    fn names(listed: &[horizon_protocol::packets::login::Property]) -> Vec<&str> {
+        listed.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// A client refuses a player list update with a 17th property: when a mod set 16 before the owner's
+    /// account arrived, the late merge lists the mod's 16 only, and in general the overrides win and the
+    /// account's other properties fill what is left, in their order.
+    #[test]
+    fn a_late_account_fetch_never_lists_more_than_16_properties() {
+        let account = fetched(vec![
+            property("textures", "owner"),
+            property("cape", "owner"),
+            property("extra", "owner"),
+        ]);
+        let mods: Vec<_> = (0..16).map(|i| property(&format!("m{i}"), "v")).collect();
+        let listed = listed_properties(&[], &mods, true, Some(&account));
+        assert_eq!(listed, mods, "16 overrides leave no slot for the account");
+        // 15 overrides leave one slot: the account's first property that is not overridden.
+        let listed = listed_properties(&[], &mods[..15], true, Some(&account));
+        assert_eq!(listed.len(), 16);
+        assert_eq!(names(&listed)[..2], ["textures", "m0"]);
+        // An overridden property of the account takes its place and costs no extra slot.
+        let mut overrides = vec![property("cape", "mod")];
+        overrides.extend(mods[..14].iter().cloned());
+        let listed = listed_properties(&[], &overrides, true, Some(&account));
+        assert_eq!(listed.len(), 16);
+        assert_eq!(names(&listed)[..2], ["textures", "cape"]);
+        assert_eq!(listed[1].value, "mod");
+        assert!(
+            !names(&listed).contains(&"extra"),
+            "the account's last gave way"
+        );
+        // Overrides over the 16 are cut (the setter refuses them, so only a stale list is cut).
+        let many: Vec<_> = (0..20).map(|i| property(&format!("m{i}"), "v")).collect();
+        assert_eq!(
+            listed_properties(&[], &many, true, Some(&account)),
+            many[..16]
+        );
+        // A name set twice is listed once, as the later one.
+        let twice = [property("textures", "a"), property("textures", "b")];
+        assert_eq!(
+            listed_properties(&[], &twice, true, Some(&account))[0],
+            property("textures", "b")
+        );
+        // A guest's login properties are cut at 16 too, and overridden by name.
+        let login: Vec<_> = (0..20).map(|i| property(&format!("l{i}"), "v")).collect();
+        let listed = listed_properties(&login, &[property("l3", "mod")], false, None);
+        assert_eq!(listed.len(), 16);
+        assert_eq!(listed[3].value, "mod");
+        assert_eq!(names(&listed)[..3], ["l0", "l1", "l2"]);
+    }
+
+    /// Several valid profiles of 16 properties each pass the frame limit in one `PlayerInfoUpdate`; the
+    /// batches keep the order and each encodes under the limit, so no connection is closed by the framing.
+    #[test]
+    fn a_player_list_is_split_into_packets_that_fit_the_frame() {
+        let entry = |i: u128| play::PlayerInfo {
+            uuid: i,
+            name: Some(format!("player{i}")),
+            properties: (0..16)
+                .map(|n| horizon_protocol::packets::login::Property {
+                    name: format!("p{n}"),
+                    value: "v".repeat(32767),
+                    signature: Some("s".repeat(1024)),
+                })
+                .collect(),
+            game_mode: Some(0),
+            listed: Some(true),
+            latency: Some(0),
+            display_name: Some(None),
+            list_order: Some(0),
+            show_hat: Some(true),
+            ..Default::default()
+        };
+        let entries: Vec<_> = (0..40).map(entry).collect();
+        let batches = info_batches(Hub::INFO_ACTIONS, entries.clone());
+        assert!(batches.len() > 1, "{} batches", batches.len());
+        for batch in &batches {
+            assert!(!batch.is_empty());
+            let bytes = C::PlayerInfoUpdate(play::PlayerInfoUpdate {
+                actions: Hub::INFO_ACTIONS,
+                entries: batch.clone(),
+            })
+            .encode();
+            assert!(
+                bytes.len() <= horizon_protocol::frame::MAX_FRAME,
+                "a batch of {} entries is {} bytes",
+                batch.len(),
+                bytes.len()
+            );
+        }
+        let flat: Vec<_> = batches.into_iter().flatten().collect();
+        assert_eq!(flat, entries, "every entry once, in order");
+        // A short list stays one packet, and no entries still give the empty list the join always sent.
+        assert_eq!(
+            info_batches(Hub::INFO_ACTIONS, entries[..3].to_vec()).len(),
+            1
+        );
+        assert_eq!(
+            info_batches(Hub::INFO_ACTIONS, Vec::new()),
+            vec![Vec::<play::PlayerInfo>::new()]
+        );
     }
 
     /// `requeue` as it was, scanning the queue for each chunk of the view.

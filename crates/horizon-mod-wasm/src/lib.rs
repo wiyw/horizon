@@ -119,7 +119,8 @@ pub enum Refusal {
     /// a hand-written codec changed, or it predates calls by name.
     Layout { built: u64, game: u64 },
     /// The mod calls or answers `call` (`Owner::method`), which this game changed (`changed`) or
-    /// no longer has: it was built against another version of that call.
+    /// doesn't have: it was built against another version of that call. A missing call may be one
+    /// this game dropped or one added after it, and the package records nothing that says which.
     Call { call: String, changed: bool },
     /// Two mods of one linked group were built against different mod APIs.
     MixedGroup { first: String, second: String },
@@ -189,7 +190,7 @@ impl std::fmt::Display for Refusal {
                 changed: false,
             } => write!(
                 f,
-                "calls `{call}`, which this game no longer has: rebuild it"
+                "calls `{call}`, which this game doesn't have: it was built for an older or newer game and needs a build for this one"
             ),
             Self::MixedGroup { first, second } => write!(
                 f,
@@ -1154,14 +1155,14 @@ mod tests {
         let packages = vec![
             package("b", "1.0.0", "lib = \"^1\"", 'b', "t", ""),
             package("lib", "1.2.0", "", 'a', "t", ""),
-            package("c", "1.0.0", "lib = \"^1\"", 'c', "t", ""),
+            package("e", "1.0.0", "lib = \"^1\"", 'c', "t", ""),
             package("alone", "1.0.0", "", 'd', "t", ""),
         ];
         let (groups, refused) = groups(&packages, horizon_mod_package::manifest::Side::Both);
         assert!(refused.is_empty());
         assert_eq!(
             ids(&packages, &groups),
-            [vec!["lib", "b", "c"], vec!["alone"]]
+            [vec!["lib", "b", "e"], vec!["alone"]]
         );
     }
 
@@ -1217,7 +1218,7 @@ mod tests {
             package("lib", "2.0.0", "", 'a', "t", ""),
             package("b", "1.0.0", "missing = \"^1\"", 'b', "t", ""),
             package(
-                "c",
+                "e",
                 "1.0.0",
                 "b = \"^1\"\nextra = { version = \"^1\", optional = true }",
                 'c',
@@ -1238,7 +1239,7 @@ mod tests {
                     }
                 ),
                 (
-                    "c".to_string(),
+                    "e".to_string(),
                     Refusal::DependencyRefused {
                         dependency: "b".into()
                     }
@@ -1288,7 +1289,7 @@ mod tests {
         let packages = vec![
             package("lib", "1.0.0", "", 'a', "t", ""),
             package("b", "1.0.0", "lib = \"^1\"", 'b', "t", &linked),
-            package("c", "1.0.0", "lib = \"^1\"", 'c', "other", ""),
+            package("e", "1.0.0", "lib = \"^1\"", 'c', "other", ""),
         ];
         let (_, refused) = groups(&packages, horizon_mod_package::manifest::Side::Both);
         assert_eq!(
@@ -1301,7 +1302,7 @@ mod tests {
                     }
                 ),
                 (
-                    "c".to_string(),
+                    "e".to_string(),
                     Refusal::Toolchain {
                         found: "other".into(),
                         group: "t".into()

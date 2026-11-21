@@ -301,14 +301,10 @@ impl Game<'_> {
             ..Style::default()
         };
         let mut context = Text::empty();
-        if cursor > 10 {
+        if horizon_client::command::java_index(input, cursor) > 10 {
             context.push("...");
         }
-        let start = (0..=cursor.saturating_sub(10))
-            .rev()
-            .find(|&i| input.is_char_boundary(i))
-            .unwrap_or(0);
-        context.push(&input[start..cursor]);
+        context.push(&input[horizon_client::command::context_start(input, cursor)..cursor]);
         if cursor < input.len() {
             context.push(
                 Text::literal(&input[cursor..])
@@ -643,7 +639,10 @@ impl Game<'_> {
             if dim == source_dim {
                 candidates.append(&mut source_candidates);
             }
-            if s.kind != 's' {
+            // EntitySelector.findEntities: a selector without entities (`@a`, `@p`, `@r`, a
+            // players-only token) reads the player list alone, which `player_candidates` gave;
+            // the level's entities would only be typed one by one and dropped.
+            if s.kind != 's' && s.include_entities {
                 if s.kind == 'e' && matches!(s.sort, Sort::Arbitrary) && !s.world_limited() {
                     candidates.extend(self.global_selector_candidates());
                 } else {

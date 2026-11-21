@@ -115,7 +115,13 @@ use horizon_core::{
 use horizon_core::{
     connection_kind::ConnectionKind, dimension::Dimension, neighbour_update::NeighbourUpdate,
 };
-use std::{collections::HashMap, io, path::Path, sync::Arc, sync::RwLock};
+use std::{
+    collections::{BTreeSet, HashMap},
+    io,
+    path::Path,
+    sync::Arc,
+    sync::RwLock,
+};
 
 pub use block_maps::BlockMaps;
 pub mod classes;
@@ -690,6 +696,15 @@ pub trait LevelAccess: BlockEntityNeighbors {
         _changed: BlockId,
         _moved: bool,
     ) {
+    }
+    /// Whether the block `state` must not run its template's own behaviour now: a mod block
+    /// whose mod is installed and switched off. Its hooks are off, and the template's ticks,
+    /// shape updates, neighbour reactions, block events and entity contacts would rewrite or
+    /// remove it, so it keeps still until the mod is on again. Only the authoritative level
+    /// answers true: a client replays what its server decided. Asked on hot paths: a vanilla
+    /// block must answer at once. The default is false.
+    fn template_suppressed(&self, _state: BlockStateId) -> bool {
+        false
     }
     /// `BlockState.randomTick` from `ServerLevel.tickChunk`, before the block
     /// handles it. The level may change the block (`Behaviours::set_block`
@@ -1427,6 +1442,18 @@ impl Behaviours {
     }
     pub fn block(&self, state: BlockStateId) -> BlockId {
         self.table.block(state)
+    }
+    /// The states whose own block template asks the ground it stands on: the live game
+    /// dispatches that ask on `Class::Vegetation` (`Sim::can_survive`, then
+    /// `Sim::may_place_on`, `survive.rs`), whose `canSurvive` asks the soil's parts and
+    /// then the plant's. A block whose chain holds no such class never asks, whatever
+    /// stands under it, so only these states reach a survival table's ground hooks
+    /// (#17943).
+    pub fn states_asking_their_ground(&self) -> BTreeSet<BlockStateId> {
+        (0..self.table.state_count())
+            .map(|id| BlockStateId(id as u32))
+            .filter(|state| self.data(*state).is(classes::Class::Vegetation))
+            .collect()
     }
     pub fn item_binding(&self, item: &str) -> Option<&ItemBinding> {
         self.items.get(item)
