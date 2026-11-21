@@ -238,18 +238,18 @@ fn tailcat_bind_error(bind: &str) -> Option<String> {
     let bind = bind.trim();
     let reject = || {
         Some(format!(
-            "server.bind {bind:?} cannot reach the helper's loopback target; leave it empty or use a loopback/wildcard address"
+            "server.bind {bind:?} cannot reach the helper's 127.0.0.1 target; leave it empty or use 127.0.0.1 or 0.0.0.0"
         ))
     };
     if bind.is_empty() {
         return None;
     }
+    let reaches_helper = |ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V4(ip) => ip.is_unspecified() || ip == std::net::Ipv4Addr::LOCALHOST,
+        std::net::IpAddr::V6(_) => false,
+    };
     if let Ok(ip) = bind.parse::<std::net::IpAddr>() {
-        return if ip.is_loopback() || ip.is_unspecified() {
-            None
-        } else {
-            reject()
-        };
+        return if reaches_helper(ip) { None } else { reject() };
     }
     let host = if let Some(host) = bind
         .strip_prefix('[')
@@ -264,7 +264,7 @@ fn tailcat_bind_error(bind: &str) -> Option<String> {
         bind
     };
     match host.parse::<std::net::IpAddr>() {
-        Ok(ip) if ip.is_loopback() || ip.is_unspecified() => None,
+        Ok(ip) if reaches_helper(ip) => None,
         _ => reject(),
     }
 }
@@ -998,10 +998,25 @@ mod tests {
 
     #[test]
     fn tailcat_bind_must_reach_the_loopback_target() {
-        for bind in ["", "127.0.0.1", "::1", "0.0.0.0", "[::]:25565"] {
+        for bind in [
+            "",
+            "127.0.0.1",
+            "127.0.0.1:25565",
+            "0.0.0.0",
+            "0.0.0.0:25565",
+        ] {
             assert!(tailcat_bind_error(bind).is_none(), "{bind}");
         }
-        for bind in ["192.168.1.10", "example.com", "[::1"] {
+        for bind in [
+            "::1",
+            "[::1]:25565",
+            "::",
+            "[::]:25565",
+            "127.0.0.2",
+            "192.168.1.10",
+            "example.com",
+            "[::1",
+        ] {
             assert!(tailcat_bind_error(bind).is_some(), "{bind}");
         }
     }
